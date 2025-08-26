@@ -95,6 +95,8 @@ def load_model_config(model_shortname, config_file="model_servers.yaml"):
             os.path.dirname(os.path.abspath(__file__)), config_file
         )
 
+
+
     try:
         with open(yaml_path, "r") as yaml_file:
             config = yaml.safe_load(yaml_file)

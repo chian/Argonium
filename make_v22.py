@@ -12,7 +12,6 @@ import time
 import random
 from openai import OpenAI
 import PyPDF2
-import spacy
 import yaml
 import argparse
 import pathlib
@@ -23,10 +22,18 @@ import threading
 import queue
 import atexit
 import multiprocessing
+import zipfile
+import io
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple, Optional, Set
 from enum import Enum
 from tqdm import tqdm
+
+# Import Argo utilities to enable automatic proxy management
+try:
+    from argo_utils import create_openai_client
+except ImportError:
+    create_openai_client = OpenAI  # Fallback to original OpenAI
 
 # Global variables for state tracking
 _file_map = {}
@@ -1381,54 +1388,91 @@ def human_readable_time(seconds: float) -> str:
         return f"{days:.2f} days"
 
 
-def signal_handler(signum, frame):
-    """
-    Signal handler for graceful shutdown on SIGINT and SIGTERM.
-    """
-    global _exit_requested, terminal_ui, _worker_pool
-    
-    # Set the exit flag to notify main process to stop
-    _exit_requested = True
-    
-    # Log shutdown message
-    shutdown_msg = "Interrupt received. Beginning graceful shutdown process..."
-    log_message("\n" + "=" * 70, log_level="WARNING")
-    log_message(shutdown_msg, log_level="WARNING")
-    log_message("=" * 70, log_level="WARNING")
-    
-    # Update UI status if available
-    if terminal_ui and _use_split_screen:
-        terminal_ui.update_stats(status_message="Shutting down... please wait")
-    
-    # Gracefully shutdown the worker pool if active
-    if _worker_pool:
-        log_message("Shutting down worker pool...", log_level="WARNING")
-        shutdown_worker_pool()
-    
-    # Sleep briefly to allow the message to be displayed
-    time.sleep(0.5)
+# Signal handler removed - Ctrl+C now works normally
 
 
 def generate_file_id(file_path: str) -> str:
     """
     Generate a unique identifier for a file using its path and last modified time.
+    Handles both regular files and files inside ZIP archives.
     """
     try:
-        mod_time = os.path.getmtime(file_path)
-        file_info = f"{file_path}_{mod_time}"
+        # Handle ZIP file paths (format: "zip_path::file_in_zip")
+        if "::" in file_path:
+            zip_path, file_in_zip = file_path.split("::", 1)
+            # Get modification time of the ZIP file
+            mod_time = os.path.getmtime(zip_path)
+            # Include both ZIP path and internal file path in the ID
+            file_info = f"{zip_path}::{file_in_zip}_{mod_time}"
+        else:
+            # Regular file
+            mod_time = os.path.getmtime(file_path)
+            file_info = f"{file_path}_{mod_time}"
+        
         # Use SHA-256 for generating a unique ID
         file_id = hashlib.sha256(file_info.encode()).hexdigest()[:16]
         return file_id
     except Exception as e:
         log_message(f"Error generating file ID for {file_path}: {e}", log_level="ERROR", error_type="file_processing")
-        basename = os.path.basename(file_path)
+        # Extract basename for fallback ID
+        if "::" in file_path:
+            # For ZIP files, use the internal file name
+            _, file_in_zip = file_path.split("::", 1)
+            basename = os.path.basename(file_in_zip)
+        else:
+            basename = os.path.basename(file_path)
         # Fallback to a simpler ID if needed
         return f"file_{basename}_{int(time.time())}"
 
 
+def is_zip_file(file_path: str) -> bool:
+    """
+    Check if a file is a ZIP file by examining its magic bytes.
+    
+    Args:
+        file_path: Path to the file to check
+        
+    Returns:
+        True if the file is a ZIP file, False otherwise
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            magic_bytes = f.read(4)
+            return magic_bytes == b'PK\x03\x04'  # ZIP file magic number
+    except Exception:
+        return False
+
+def get_zip_contents(zip_path: str) -> List[Tuple[str, str]]:
+    """
+    Get a list of files inside a ZIP file that match supported extensions.
+    
+    Args:
+        zip_path: Path to the ZIP file
+        
+    Returns:
+        List of tuples (file_path_in_zip, full_zip_path)
+    """
+    result = []
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+            for file_info in zip_file.filelist:
+                # Skip directories
+                if file_info.is_dir():
+                    continue
+                    
+                # Check if file has supported extension
+                file_name = file_info.filename
+                if any(file_name.lower().endswith(ext) for ext in ['.pdf', '.txt', '.md']):
+                    result.append((file_name, zip_path))
+    except Exception as e:
+        log_message(f"Error reading ZIP file {zip_path}: {e}", log_level="ERROR", error_type="file_processing")
+    
+    return result
+
 def find_files_recursively(directory: str, extensions: list) -> list:
     """
     Recursively find all files with given extensions in directory and its subdirectories.
+    Also includes files inside ZIP files.
     
     Args:
         directory: The root directory to search
@@ -1438,12 +1482,26 @@ def find_files_recursively(directory: str, extensions: list) -> list:
         List of tuples (relative_path, absolute_path)
     """
     result = []
+    
+    # First, find regular files
     for root, _, files in os.walk(directory):
         for file in files:
-            if any(file.lower().endswith(ext) for ext in extensions):
-                rel_path = os.path.relpath(os.path.join(root, file), directory)
-                abs_path = os.path.join(root, file)
-                result.append((rel_path, abs_path))
+            file_path = os.path.join(root, file)
+            
+            # Check if it's a ZIP file
+            if is_zip_file(file_path):
+                # Get contents of ZIP file
+                zip_contents = get_zip_contents(file_path)
+                for zip_file_path, zip_path in zip_contents:
+                    # Create a virtual path that represents the file inside the ZIP
+                    virtual_path = f"{os.path.relpath(zip_path, directory)}/{zip_file_path}"
+                    result.append((virtual_path, f"{zip_path}::{zip_file_path}"))
+            else:
+                # Regular file
+                if any(file.lower().endswith(ext) for ext in extensions):
+                    rel_path = os.path.relpath(file_path, directory)
+                    result.append((rel_path, file_path))
+    
     return result
 
 
@@ -2817,11 +2875,27 @@ def process_chunks_with_parallel_workers(chunk_ids: List[str], chunks_dir: str, 
                             log_message(f"Generated question from chunk {chunk_id} (Question #{successful_questions})")
                         
                         # Create question data for output file - using NAT-MC.json format
+                        # Extract file_id from chunk_id to get file metadata
+                        file_id = chunk_id.split('_')[0] if '_' in chunk_id else None
+                        file_metadata = {}
+                        
+                        if file_id and file_id in _file_map:
+                            file_info = _file_map[file_id]
+                            file_metadata = {
+                                'source_file_path': file_info.get('file_path', ''),
+                                'source_relative_path': file_info.get('relative_path', ''),
+                                'source_filename': file_info.get('filename', ''),
+                                'source_file_size': file_info.get('size', 0),
+                                'source_file_type': file_info.get('type', ''),
+                                'source_last_modified': file_info.get('last_modified', 0)
+                            }
+                        
                         question_data = {
                             'question': result.get('question', ''),
                             'answer': result.get('answer', ''),
                             'text': result.get('text', ''),
                             'type': result.get('type', ''),
+                            **file_metadata  # Add all file metadata fields
                         }
                         
                         # Add reasoning trace for reasoning trace mode
@@ -2958,11 +3032,27 @@ def process_chunks_with_parallel_workers(chunk_ids: List[str], chunks_dir: str, 
                             log_message(f"Generated question from chunk {chunk_id} (Question #{successful_questions})")
                         
                         # Create question data for output file - using NAT-MC.json format
+                        # Extract file_id from chunk_id to get file metadata
+                        file_id = chunk_id.split('_')[0] if '_' in chunk_id else None
+                        file_metadata = {}
+                        
+                        if file_id and file_id in _file_map:
+                            file_info = _file_map[file_id]
+                            file_metadata = {
+                                'source_file_path': file_info.get('file_path', ''),
+                                'source_relative_path': file_info.get('relative_path', ''),
+                                'source_filename': file_info.get('filename', ''),
+                                'source_file_size': file_info.get('size', 0),
+                                'source_file_type': file_info.get('type', ''),
+                                'source_last_modified': file_info.get('last_modified', 0)
+                            }
+                        
                         question_data = {
                             'question': result.get('question', ''),
                             'answer': result.get('answer', ''),
                             'text': result.get('text', ''),
                             'type': result.get('type', ''),
+                            **file_metadata  # Add all file metadata fields
                         }
                         
                         # Add reasoning trace for reasoning trace mode
@@ -3069,6 +3159,13 @@ class CheckpointManager:
         self.last_save_time = 0
         self.save_interval = 10  # Save at least every 10 seconds for better progress tracking
         self.question_type = None  # Will be set later via set_question_type()
+        # Throttle checkpoint log noise
+        self._last_checkpoint_log_time = 0.0
+        self._last_checkpoint_counts = {
+            'processed': -1,
+            'chunks': -1,
+            'questions': -1
+        }
 
         # Store this instance as the singleton
         CheckpointManager._instance = self
@@ -3276,11 +3373,31 @@ class CheckpointManager:
             questions_count = len(self.checkpoint_data['questions'])
             
             # Use log_message instead of print to ensure output goes to the correct pane
-            if self.question_type and hasattr(self.question_type, 'value') and self.question_type.value == "rt":
+            if hasattr(self, 'question_type') and self.question_type and hasattr(self.question_type, 'value') and self.question_type.value == "rt":
                 label = "traces"
             else:
                 label = "questions"
-            log_message(f"Checkpoint saved: {processed_count} files, {chunks_count} chunks, {questions_count} {label}")
+
+            # Throttle noisy checkpoint logs: print only if counts changed meaningfully or time elapsed
+            now_ts = time.time()
+            counts_changed = (
+                processed_count != self._last_checkpoint_counts.get('processed') or
+                chunks_count    != self._last_checkpoint_counts.get('chunks') or
+                questions_count != self._last_checkpoint_counts.get('questions')
+            )
+            # Log if at least 15s passed or counts jumped by notable step
+            significant_jump = (
+                abs(chunks_count - self._last_checkpoint_counts.get('chunks', 0)) >= 25 or
+                abs(processed_count - self._last_checkpoint_counts.get('processed', 0)) >= 5
+            )
+            if (now_ts - self._last_checkpoint_log_time) >= 15 or significant_jump:
+                log_message(f"Checkpoint saved: {processed_count} files, {chunks_count} chunks, {questions_count} {label}")
+                self._last_checkpoint_log_time = now_ts
+                self._last_checkpoint_counts = {
+                    'processed': processed_count,
+                    'chunks': chunks_count,
+                    'questions': questions_count
+                }
 
             # Update last save time
             self.last_save_time = time.time()
@@ -3322,7 +3439,7 @@ class CheckpointManager:
         new_status = chunk_data.get('status', 'none')
         if status_changed:
             # If changing from 'extracted' to a processed status, increment processed_chunks
-            if old_status == 'extracted' and new_status in ['completed', 'low_score', 'error']:
+            if old_status == 'extracted' and new_status in ['completed', 'low_score', 'error', 'filtered_non_relevant']:
                 self.checkpoint_data['counters']['processed_chunks'] += 1
                 # Also decrement extracted_chunks since it's no longer just extracted
                 self.checkpoint_data['counters']['extracted_chunks'] = max(0, self.checkpoint_data['counters']['extracted_chunks'] - 1)
@@ -3333,6 +3450,21 @@ class CheckpointManager:
         # If this resulted in a completed question, add it to questions
         if chunk_data.get('status') == 'completed':
             # Create a question entry from the chunk data
+            # Extract file_id from chunk_id to get file metadata
+            file_id = chunk_id.split('_')[0] if '_' in chunk_id else None
+            file_metadata = {}
+            
+            if file_id and file_id in self.checkpoint_data.get('processed_files', {}):
+                file_info = self.checkpoint_data['processed_files'][file_id]
+                file_metadata = {
+                    'source_file_path': file_info.get('file_path', ''),
+                    'source_relative_path': file_info.get('relative_path', ''),
+                    'source_filename': file_info.get('filename', ''),
+                    'source_file_size': file_info.get('size', 0),
+                    'source_file_type': file_info.get('type', ''),
+                    'source_last_modified': file_info.get('last_modified', 0)
+                }
+            
             question_data = {
                 'question': chunk_data.get('question', ''),
                 'answer': chunk_data.get('answer', ''),
@@ -3340,7 +3472,8 @@ class CheckpointManager:
                 'type': chunk_data.get('type', ''),
                 'score': chunk_data.get('score', 0),
                 'chunk_id': chunk_id,
-                'processing_time': chunk_data.get('processing_time', 0)
+                'processing_time': chunk_data.get('processing_time', 0),
+                **file_metadata  # Add all file metadata fields
             }
 
             # Add to questions list
@@ -3396,7 +3529,7 @@ class CheckpointManager:
         Check if a chunk has already been processed.
         """
         return (chunk_id in self.checkpoint_data['processed_chunks'] and 
-               self.checkpoint_data['processed_chunks'][chunk_id].get('status') in ['completed', 'low_score'])
+               self.checkpoint_data['processed_chunks'][chunk_id].get('status') in ['completed', 'low_score', 'filtered_non_relevant'])
 
     def get_unprocessed_chunks(self) -> List[str]:
         """
@@ -3470,7 +3603,7 @@ class CheckpointManager:
         """
         total_chunks = len(self.checkpoint_data['processed_chunks'])
         completed_chunks = sum(1 for c in self.checkpoint_data['processed_chunks'].values()
-                           if c.get('status') in ['completed', 'low_score'])
+                           if c.get('status') in ['completed', 'low_score', 'filtered_non_relevant'])
         error_chunks = sum(1 for c in self.checkpoint_data['processed_chunks'].values()
                        if c.get('status') == 'error')
         
@@ -3483,7 +3616,7 @@ class CheckpointManager:
         }
 
 
-def display_exit_summary(stats, error_stats, completion_percentage, chunk_percentage, checkpoint_manager):
+def display_exit_summary(stats, error_stats, completion_percentage, chunk_percentage, checkpoint_manager, question_type=None):
     """
     Display a comprehensive exit summary with all processing statistics.
     """
@@ -3566,7 +3699,7 @@ def display_exit_summary(stats, error_stats, completion_percentage, chunk_percen
 def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_name: str, 
                      chunk_size: int, question_type: QuestionType, num_answers: int, min_score: int,
                      checkpoint_file: str, force_restart: bool = False,
-                     recursive: bool = False, chunks_only: bool = False, workers: int = None):
+                     recursive: bool = False, chunks_only: bool = False, workers: int = None, args=None):
     """
     Main function for the V16 version with parallel processing:
     1) Create a map of all input files with unique identifiers
@@ -3612,9 +3745,7 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
     else:
         log_message("Terminal UI initialization failed, falling back to standard output", log_level="WARNING")
     
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler) # kill command
+    # Signal handlers removed - Ctrl+C now works normally
     
     # Initialize the checkpoint manager
     checkpoint_manager = CheckpointManager(checkpoint_file, force_restart)
@@ -3681,39 +3812,82 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
         
         # Initialize file map
         if recursive:
-            log_message("Recursively searching for files...")
+            log_message("Recursively searching for files (including ZIP archives)...")
             if terminal_ui and _use_split_screen:
-                terminal_ui.update_stats(status_message="Recursively searching for files...")
-            
-            file_tuples = find_files_recursively(input_dir, ['.pdf', '.txt', '.md'])
-            
-            # Create file map
-            for rel_path, abs_path in file_tuples:
-                file_id = generate_file_id(abs_path)
-                # Skip if this file is already fully processed
-                if file_id in processed_files and processed_files[file_id].get('status') == 'chunked':
-                    log_message(f"File {os.path.basename(abs_path)} already processed, loading from checkpoint")
-                    _file_map[file_id] = processed_files[file_id]
-                    
-                    # Increment counter in a thread-safe way
-                    with _counter_lock:
-                        _processed_files += 1
-                    
-                    # Update the UI to show the correct file count
-                    if terminal_ui and _use_split_screen:
-                        # Force immediate stats update to ensure UI is in sync with counters
-                        terminal_ui.update_stats(files_processed=_processed_files)
-                        update_global_stats()
-                        
-                    continue
-                    
+                terminal_ui.update_stats(status_message="Recursively searching for files (including ZIP archives)...")
+        else:
+            log_message("Searching for files (including ZIP archives)...")
+            if terminal_ui and _use_split_screen:
+                terminal_ui.update_stats(status_message="Searching for files (including ZIP archives)...")
+        
+        file_tuples = find_files_recursively(input_dir, ['.pdf', '.txt', '.md'])
+        log_message(f"File discovery: found {len(file_tuples)} files with supported extensions", log_level="INFO")
+        
+        # Log ZIP file discovery
+        zip_files = [f for f in file_tuples if "::" in f[1]]
+        if zip_files:
+            log_message(f"Found {len(zip_files)} files inside ZIP archives")
+            # Show some examples
+            for i, (rel_path, abs_path) in enumerate(zip_files[:3]):
+                zip_path, file_in_zip = abs_path.split("::", 1)
+                log_message(f"  Example: {os.path.basename(zip_path)}/{file_in_zip}")
+            if len(zip_files) > 3:
+                log_message(f"  ... and {len(zip_files) - 3} more files in ZIP archives")
+        
+        # Create file map
+        for rel_path, abs_path in file_tuples:
+            file_id = generate_file_id(abs_path)
+            # Skip if this file is already fully processed
+            if file_id in processed_files and processed_files[file_id].get('status') == 'chunked':
+                log_message(f"File {os.path.basename(abs_path)} already processed, loading from checkpoint")
+                _file_map[file_id] = processed_files[file_id]
+                
+                # Increment counter in a thread-safe way
+                with _counter_lock:
+                    _processed_files += 1
+                
+                # Update the UI to show the correct file count
+                if terminal_ui and _use_split_screen:
+                    # Force immediate stats update to ensure UI is in sync with counters
+                    terminal_ui.update_stats(files_processed=_processed_files)
+                    update_global_stats()
+                
+                continue
+            else:
+                # Handle ZIP file paths
+                if "::" in abs_path:
+                    # This is a file inside a ZIP
+                    zip_path, file_in_zip = abs_path.split("::", 1)
+                    file_name = os.path.basename(file_in_zip)
+                    file_ext = os.path.splitext(file_in_zip)[1].lower()[1:]
+                    # Get size from ZIP file info
+                    try:
+                        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                            file_info = zip_file.getinfo(file_in_zip)
+                            file_size = file_info.file_size
+                            file_time = file_info.date_time
+                            # Convert ZIP time to timestamp
+                            import datetime
+                            file_timestamp = datetime.datetime(*file_time).timestamp()
+                    except Exception as e:
+                        log_message(f"Error getting ZIP file info for {abs_path}: {e}", log_level="WARNING")
+                        file_size = 0
+                        file_timestamp = time.time()
+                else:
+                    # Regular file
+                    file_name = os.path.basename(abs_path)
+                    file_ext = os.path.splitext(abs_path)[1].lower()[1:]
+                    file_size = os.path.getsize(abs_path)
+                    file_timestamp = os.path.getmtime(abs_path)
+                
+                # Add file to map (both ZIP and regular files)
                 _file_map[file_id] = {
                     'file_path': abs_path,
                     'relative_path': rel_path,
-                    'filename': os.path.basename(abs_path),
-                    'size': os.path.getsize(abs_path),
-                    'last_modified': os.path.getmtime(abs_path),
-                    'type': os.path.splitext(abs_path)[1].lower()[1:],
+                    'filename': file_name,
+                    'size': file_size,
+                    'last_modified': file_timestamp,
+                    'type': file_ext,
                     'status': 'pending',
                     'discovery_time': time.time()
                 }
@@ -3741,13 +3915,39 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                             
                         continue
                         
+                    # Handle ZIP file paths
+                    if "::" in file_path:
+                        # This is a file inside a ZIP
+                        zip_path, file_in_zip = file_path.split("::", 1)
+                        file_name = os.path.basename(file_in_zip)
+                        file_ext = os.path.splitext(file_in_zip)[1].lower()[1:]
+                        # Get size from ZIP file info
+                        try:
+                            with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                                file_info = zip_file.getinfo(file_in_zip)
+                                file_size = file_info.file_size
+                                file_time = file_info.date_time
+                                # Convert ZIP time to timestamp
+                                import datetime
+                                file_timestamp = datetime.datetime(*file_time).timestamp()
+                        except Exception as e:
+                            log_message(f"Error getting ZIP file info for {file_path}: {e}", log_level="WARNING")
+                            file_size = 0
+                            file_timestamp = time.time()
+                    else:
+                        # Regular file
+                        file_name = filename
+                        file_ext = os.path.splitext(filename)[1].lower()[1:]
+                        file_size = os.path.getsize(file_path)
+                        file_timestamp = os.path.getmtime(file_path)
+                    
                     _file_map[file_id] = {
                         'file_path': file_path,
                         'relative_path': filename,
-                        'filename': filename,
-                        'size': os.path.getsize(file_path),
-                        'last_modified': os.path.getmtime(file_path),
-                        'type': os.path.splitext(filename)[1].lower()[1:],
+                        'filename': file_name,
+                        'size': file_size,
+                        'last_modified': file_timestamp,
+                        'type': file_ext,
                         'status': 'pending',
                         'discovery_time': time.time()
                     }
@@ -3946,17 +4146,85 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
             )
             update_global_stats()
         
-        # Initialize the worker pool
-        init_worker_pool(_max_workers)
-                
-        # Process all chunks in parallel 
-        results = process_chunks_with_parallel_workers(
-            all_chunk_ids, chunks_dir, model_name, question_type,
-            num_answers, min_score, checkpoint_manager, output_file
-        )
-        
-        # Shutdown the worker pool after processing
-        shutdown_worker_pool()
+        # Check if enhanced processing is enabled
+        if hasattr(args, '_use_enhanced') and args._use_enhanced:
+            # Use enhanced parallel processing
+            from make_v22_enhanced import run_enhanced_processing
+            
+            # Convert question_type enum to string
+            if hasattr(question_type, 'value'):
+                question_type_str = question_type.value.lower()
+            else:
+                question_type_str = str(question_type).lower()
+            
+            # Map question types to enhanced processing format
+            type_mapping = {
+                'multiplechoice': 'multiple_choice',
+                'multiple_choice': 'multiple_choice', 
+                'freeform': 'free_form',
+                'free_form': 'free_form',
+                'reasoningtrace': 'reasoning_trace',
+                'reasoning_trace': 'reasoning_trace'
+            }
+            question_type_str = type_mapping.get(question_type_str, question_type_str)
+            
+            log_message(f"Using enhanced processing with {args.max_concurrent_calls} concurrent API calls")
+            
+            # Call enhanced processing function
+            results = run_enhanced_processing(
+                chunk_ids=all_chunk_ids,
+                chunks_dir=chunks_dir,
+                model_name=args.model,  # Use original shortname for YAML lookup
+                question_type=question_type_str,
+                num_answers=num_answers,
+                min_score=min_score,
+                checkpoint_manager=checkpoint_manager,
+                output_file=output_file,
+                max_concurrent_calls=args.max_concurrent_calls,
+                file_map=_file_map  # Pass the global file map
+            )
+            
+            # Write results to output file (enhanced processing doesn't do this automatically)
+            if results:
+                log_message(f"Writing {len(results)} results to {output_file}")
+                try:
+                    # Load existing questions if file exists
+                    existing_questions = []
+                    if os.path.exists(output_file):
+                        try:
+                            with open(output_file, 'r', encoding='utf-8') as f:
+                                existing_questions = json.load(f)
+                                if not isinstance(existing_questions, list):
+                                    existing_questions = []
+                        except (json.JSONDecodeError, IOError):
+                            existing_questions = []
+                    
+                    # Add new results
+                    existing_questions.extend(results)
+                    
+                    # Write back to file
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        json.dump(existing_questions, f, ensure_ascii=False, indent=2)
+                    
+                    log_message(f"Successfully wrote {len(existing_questions)} total questions to {output_file}")
+                    
+                except Exception as e:
+                    log_message(f"Error writing results to {output_file}: {e}", log_level="ERROR")
+            else:
+                log_message("No results returned from enhanced processing")
+        else:
+            # Use original parallel processing
+            # Initialize the worker pool
+            init_worker_pool(_max_workers)
+                    
+            # Process all chunks in parallel 
+            results = process_chunks_with_parallel_workers(
+                all_chunk_ids, chunks_dir, model_name, question_type,
+                num_answers, min_score, checkpoint_manager, output_file
+            )
+            
+            # Shutdown the worker pool after processing
+            shutdown_worker_pool()
         
         processing_time = time.time() - processing_start_time
         total_time = time.time() - start_time
@@ -4082,7 +4350,7 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                     log_message(f"- Error writing final error summary: {e}", log_level="ERROR")
                     
             # Display comprehensive exit summary to console
-            display_exit_summary(stats, error_stats, completion_percentage, chunk_percentage, checkpoint_manager)
+            display_exit_summary(stats, error_stats, completion_percentage, chunk_percentage, checkpoint_manager, checkpoint_manager.question_type)
             
         except Exception as e:
             log_message(f"- Error saving final checkpoint: {e}", log_level="ERROR")
@@ -4148,79 +4416,142 @@ def create_chunk_id(file_id: str, chunk_index: int) -> str:
     
 def extract_text_from_pdf(file_path: str) -> str:
     """
-    Extract text from a PDF file.
+    Extract text from a PDF file. Supports both regular files and files inside ZIP archives.
     """
     text = ""
-    try:
-        # Open the PDF file
-        with open(file_path, 'rb') as f:
-            # Create a PDF reader object
-            pdf_reader = PyPDF2.PdfReader(f)
-            
-            # Extract text from each page
-            for page_num in range(len(pdf_reader.pages)):
-                page = pdf_reader.pages[page_num]
-                page_text = page.extract_text()
+    
+    # Check if this is a ZIP file reference
+    if "::" in file_path:
+        # Extract from ZIP file
+        zip_path, file_in_zip = file_path.split("::", 1)
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                # Read the file from ZIP
+                with zip_file.open(file_in_zip, 'r') as f:
+                    # Create a PDF reader object from the ZIP file content
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(f.read()))
+                    
+                    # Extract text from each page
+                    for page_num in range(len(pdf_reader.pages)):
+                        page = pdf_reader.pages[page_num]
+                        page_text = page.extract_text()
+                        
+                        # Only add non-empty text
+                        if page_text and page_text.strip():
+                            text += page_text + "\n\n"
+        except zipfile.BadZipFile as e:
+            log_message(f"Bad ZIP file: {zip_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except KeyError as e:
+            log_message(f"File not found in ZIP: {file_in_zip} in {zip_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except Exception as e:
+            log_message(f"Error extracting PDF from ZIP {zip_path}/{file_in_zip}: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+    else:
+        # Regular file
+        try:
+            # Open the PDF file
+            with open(file_path, 'rb') as f:
+                # Create a PDF reader object
+                pdf_reader = PyPDF2.PdfReader(f)
                 
-                # Only add non-empty text
-                if page_text and page_text.strip():
-                    text += page_text + "\n\n"
-    except FileNotFoundError as e:
-        log_message(f"PDF file not found: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-    except PermissionError as e:
-        log_message(f"Permission denied accessing PDF file: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-    except PyPDF2.errors.PdfReadError as e:
-        log_message(f"PDF read error - file may be corrupted or encrypted: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-    except OSError as e:
-        log_message(f"OS error accessing PDF file: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-    except Exception as e:
-        log_message(f"Unexpected error extracting text from PDF {file_path}: {e}", 
-                   log_level="ERROR", error_type="file_processing")
+                # Extract text from each page
+                for page_num in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_num]
+                    page_text = page.extract_text()
+                    
+                    # Only add non-empty text
+                    if page_text and page_text.strip():
+                        text += page_text + "\n\n"
+        except FileNotFoundError as e:
+            log_message(f"PDF file not found: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except PermissionError as e:
+            log_message(f"Permission denied accessing PDF file: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except PyPDF2.errors.PdfReadError as e:
+            log_message(f"PDF read error - file may be corrupted or encrypted: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except OSError as e:
+            log_message(f"OS error accessing PDF file: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+        except Exception as e:
+            log_message(f"Unexpected error extracting text from PDF {file_path}: {e}", 
+                       log_level="ERROR", error_type="file_processing")
     
     return text
 
 
 def extract_text_from_txt(file_path: str) -> str:
     """
-    Extract text from a TXT or MD file.
+    Extract text from a TXT or MD file. Supports both regular files and files inside ZIP archives.
     """
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            text = f.read()
-        return text
-    except FileNotFoundError as e:
-        log_message(f"Text file not found: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-        return ""
-    except PermissionError as e:
-        log_message(f"Permission denied accessing text file: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-        return ""
-    except UnicodeDecodeError as e:
-        log_message(f"Unicode decode error in text file: {file_path}. Trying fallback encoding. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
+    # Check if this is a ZIP file reference
+    if "::" in file_path:
+        # Extract from ZIP file
+        zip_path, file_in_zip = file_path.split("::", 1)
         try:
-            # Try a different encoding if utf-8 fails
-            with open(file_path, 'r', encoding='latin-1', errors='replace') as f:
-                text = f.read()
-            log_message(f"Successfully read {file_path} with latin-1 encoding", log_level="INFO")
-            return text
-        except Exception as fallback_e:
-            log_message(f"Error with fallback encoding for {file_path}: {fallback_e}", 
+            with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                # Read the file from ZIP
+                with zip_file.open(file_in_zip, 'r') as f:
+                    # Try UTF-8 first
+                    try:
+                        text = f.read().decode('utf-8')
+                        return text
+                    except UnicodeDecodeError:
+                        # Try latin-1 as fallback
+                        f.seek(0)  # Reset file pointer
+                        text = f.read().decode('latin-1', errors='replace')
+                        log_message(f"Successfully read {file_in_zip} from {zip_path} with latin-1 encoding", log_level="INFO")
+                        return text
+        except zipfile.BadZipFile as e:
+            log_message(f"Bad ZIP file: {zip_path}. Error: {e}", 
                        log_level="ERROR", error_type="file_processing")
             return ""
-    except OSError as e:
-        log_message(f"OS error accessing text file: {file_path}. Error: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-        return ""
-    except Exception as e:
-        log_message(f"Unexpected error extracting text from {file_path}: {e}", 
-                   log_level="ERROR", error_type="file_processing")
-        return ""
+        except KeyError as e:
+            log_message(f"File not found in ZIP: {file_in_zip} in {zip_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
+        except Exception as e:
+            log_message(f"Error extracting text from ZIP {zip_path}/{file_in_zip}: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
+    else:
+        # Regular file
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            return text
+        except FileNotFoundError as e:
+            log_message(f"Text file not found: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
+        except PermissionError as e:
+            log_message(f"Permission denied accessing text file: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
+        except UnicodeDecodeError as e:
+            log_message(f"Unicode decode error in text file: {file_path}. Trying fallback encoding. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            try:
+                # Try a different encoding if utf-8 fails
+                with open(file_path, 'r', encoding='latin-1', errors='replace') as f:
+                    text = f.read()
+                log_message(f"Successfully read {file_path} with latin-1 encoding", log_level="INFO")
+                return text
+            except Exception as fallback_e:
+                log_message(f"Error with fallback encoding for {file_path}: {fallback_e}", 
+                           log_level="ERROR", error_type="file_processing")
+                return ""
+        except OSError as e:
+            log_message(f"OS error accessing text file: {file_path}. Error: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
+        except Exception as e:
+            log_message(f"Unexpected error extracting text from {file_path}: {e}", 
+                       log_level="ERROR", error_type="file_processing")
+            return ""
             
             
 def split_text_into_chunks(text: str, chunk_size: int = 500) -> List[str]:
@@ -4258,8 +4589,8 @@ def split_text_into_chunks(text: str, chunk_size: int = 500) -> List[str]:
             
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Generate questions from text documents. V22 supports multiple-choice questions, free-form questions, and reasoning traces.')
-    parser.add_argument('input_directory', help='Directory containing PDF, TXT, or MD files')
+        description='Generate questions from text documents. V22 supports multiple-choice questions, free-form questions, reasoning traces, and ZIP file processing.')
+    parser.add_argument('input_directory', help='Directory containing PDF, TXT, MD files, or ZIP files containing these formats')
     parser.add_argument('--type', type=QuestionType, choices=list(QuestionType), default=QuestionType.MULTIPLE_CHOICE, 
                         help='Type of questions to generate: mc (multiple-choice), qa (free-form), or rt (reasoning-trace)')
     parser.add_argument('--output', default='output.json', help='Output JSON file (default: output.json)')
@@ -4279,6 +4610,15 @@ def parse_arguments():
     parser.add_argument('--no-split-screen', action='store_true', help='Disable the split-screen UI and use standard console output')
     parser.add_argument('--workers', type=int, default=None, help='Number of worker processes to use for parallel processing (default: CPU count - 1)')
     parser.add_argument('--error-threshold', type=int, default=200, help='Maximum number of errors of any type before stopping (default: 200)')
+    
+    # Enhanced parallel processing options
+    enhanced_group = parser.add_argument_group('Enhanced Processing Options')
+    enhanced_group.add_argument('--enhanced', action='store_true', 
+                               help='Enable enhanced parallel processing with 50-500+ concurrent API calls and failure tracking')
+    enhanced_group.add_argument('--max-concurrent-calls', type=int, default=100,
+                               help='Maximum concurrent API calls for enhanced mode (default: 100)')
+
+    
     return parser.parse_args()
     
     
@@ -4289,6 +4629,7 @@ def configure_apis(model_name: str, config_file: str = "model_servers.yaml") -> 
     Configure the necessary APIs based on model selection.
     
     Args:
+
         model_name: The model shortname to use
         config_file: Path to the model configuration file
     
@@ -4304,6 +4645,8 @@ def configure_apis(model_name: str, config_file: str = "model_servers.yaml") -> 
     except Exception as e:
         log_message(f"Error loading {config_file}: {e}", log_level="ERROR")
         sys.exit(1)
+    
+
     
     # Find the selected model's configuration
     selected_server = None
@@ -4345,7 +4688,7 @@ def configure_apis(model_name: str, config_file: str = "model_servers.yaml") -> 
         client_config["organization"] = selected_server["org_id"]
     
     # Create the client
-    _openai_client = OpenAI(**client_config)
+    _openai_client = create_openai_client(**client_config)
     
     # Get the actual model name to use
     actual_model_name = selected_server.get("openai_model")
@@ -4366,6 +4709,24 @@ def main():
     
     # Parse command-line arguments
     args = parse_arguments()
+    
+    # Check if enhanced processing is requested
+    if args.enhanced:
+        try:
+            from make_v22_enhanced import run_enhanced_processing
+            print("🚀 Enhanced parallel processing mode enabled!")
+            print(f"   Max concurrent API calls: {args.max_concurrent_calls}")
+            print(f"   Failure tracking and retry: ✓")
+            print(f"   Performance monitoring: ✓")
+            
+            # Set flag to use enhanced processing later
+            args._use_enhanced = True
+        except ImportError as e:
+            print(f"❌ Enhanced processing not available: {e}")
+            print("   Falling back to standard processing...")
+            args._use_enhanced = False
+    else:
+        args._use_enhanced = False
     
     # Set error threshold from command line argument
     _max_error_threshold = args.error_threshold
@@ -4414,7 +4775,8 @@ def main():
         force_restart=args.force_restart,
         recursive=args.recursive,
         chunks_only=args.chunks_only,
-        workers=args.workers
+        workers=args.workers,
+        args=args  # Pass the full args object for enhanced processing
     )
 
 
