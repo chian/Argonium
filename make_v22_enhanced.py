@@ -708,6 +708,7 @@ class EnhancedChunkProcessor:
                 in_flight: List[asyncio.Task] = []
                 in_flight_start_times: Dict[asyncio.Task, float] = {}  # Track when each task started
                 chunk_iter = iter(all_chunks)
+                remaining_chunks = len(all_chunks)  # Track remaining chunks
                 last_adjust_ts = time.time()
                 last_status_print = time.time()
 
@@ -722,6 +723,7 @@ class EnhancedChunkProcessor:
                     if 0: print(f"DEBUG: Created task object: {task}")
                     in_flight.append(task)
                     in_flight_start_times[task] = time.time()  # Track start time
+                
                 # Process tasks with minimal wait time for immediate response
                 while in_flight:
                     if 0: print(f"DEBUG: About to wait on {len(in_flight)} tasks")
@@ -747,8 +749,9 @@ class EnhancedChunkProcessor:
                         await self.save_results_incrementally(new_results)
                     
                     # Refill window immediately
-                    while len(in_flight) < window:
+                    while len(in_flight) < window and remaining_chunks > 0:
                         cid = next(chunk_iter)
+                        remaining_chunks -= 1
                         if 0: print(f"DEBUG: Creating refill task for chunk {cid}")
                         task = asyncio.create_task(process_single_chunk(cid))
                         in_flight.append(task)

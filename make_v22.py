@@ -747,6 +747,10 @@ def batched_openai_completion(model: str, messages: list, **kwargs):
             log_message(f"Unexpected API error. {error_details}. Context: {error_context}", 
                        log_level="ERROR", error_type="api")
         
+        # DEBUG: Log the actual JSON being sent
+        import json
+        print(f"DEBUG: JSON sent to API: {json.dumps(request_params, indent=2)}")
+        
         # Re-raise the exception so calling code can handle it appropriately
         raise
 
