@@ -244,7 +244,11 @@ class EnhancedAPIManager:
         
         # Semaphore to limit concurrent API calls
         self.semaphore = asyncio.Semaphore(max_concurrent_calls)
-        
+
+        # ThreadPoolExecutor sized to match concurrency for run_in_executor calls
+        from concurrent.futures import ThreadPoolExecutor
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent_calls)
+
         self.async_client = None
         self.stats = ProcessingStats()
         # In-flight API tracking
@@ -322,6 +326,8 @@ class EnhancedAPIManager:
         """Async context manager exit"""
         if self.async_client:
             await self.async_client.close()
+        if self.executor:
+            self.executor.shutdown(wait=False)
 
     @backoff.on_exception(
         backoff.expo,
@@ -440,7 +446,7 @@ class EnhancedAPIManager:
         loop = asyncio.get_event_loop()
         if 0: print(f"DEBUG: Got event loop for {chunk_id}: {type(loop)}")
         result = await loop.run_in_executor(
-            None,
+            self.executor,
             generate_multiple_choice_qa_pairs,
             chunk_id, chunk_text, self.model_name, num_answers, min_score
         )
@@ -484,8 +490,8 @@ class EnhancedAPIManager:
         # Call the original function (it's synchronous)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, 
-            generate_free_form_qa_pairs, 
+            self.executor,
+            generate_free_form_qa_pairs,
             chunk_id, chunk_text, self.model_name, min_score
         )
         
@@ -528,8 +534,8 @@ class EnhancedAPIManager:
         # Call the original function (it's synchronous)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, 
-            generate_reasoning_trace_pairs, 
+            self.executor,
+            generate_reasoning_trace_pairs,
             chunk_id, chunk_text, self.model_name, min_score
         )
         
