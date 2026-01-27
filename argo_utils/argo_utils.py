@@ -312,19 +312,31 @@ def create_openai_client(**kwargs):
 
 def create_async_openai_client(**kwargs):
     """Create an AsyncOpenAI client with automatic Argo proxy management"""
+    import httpx
     base_url = kwargs.get('base_url')
-    
+
     # Handle CELS bridge service SSL issues
     if base_url and 'argo-bridge.cels.anl.gov' in base_url:
-        import httpx
         # Create client with SSL verification disabled for CELS bridge
-        kwargs['http_client'] = httpx.AsyncClient(verify=False)
+        kwargs['http_client'] = httpx.AsyncClient(
+            verify=False,
+            limits=httpx.Limits(max_connections=10000, max_keepalive_connections=1000)
+        )
         print("Note: Using CELS Argo bridge with SSL verification disabled")
     elif base_url and 'localhost' in base_url:
         # This is a local Argo configuration, try to start proxy
         manager = get_argo_manager()
         if not manager.ensure_proxy_running():
             print("Warning: Failed to start Argo proxy. API calls may fail.")
-    
+        # Still set high connection limits for local
+        kwargs['http_client'] = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=10000, max_keepalive_connections=1000)
+        )
+    else:
+        # For any other server (like local kimi), use high connection limits
+        kwargs['http_client'] = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=10000, max_keepalive_connections=1000)
+        )
+
     from openai import AsyncOpenAI
     return AsyncOpenAI(**kwargs)
