@@ -679,8 +679,9 @@ class EnhancedChunkProcessor:
             api_key=api_key,
             base_url=base_url
         ) as api_manager:
-            # Create semaphore for chunk-level concurrency (use max_concurrent_calls)
-            chunk_semaphore = asyncio.Semaphore(min(self.max_concurrent_calls, len(all_chunks)))
+            # Create semaphore for chunk-level concurrency - set high to avoid double-throttling
+            # API manager already has its own semaphore for actual API calls
+            chunk_semaphore = asyncio.Semaphore(len(all_chunks))  # Allow all chunks to start
             # Watchdog and health tracking
             last_completion_ts = time.time()
             last_health_write_ts = time.time()
