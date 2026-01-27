@@ -55,6 +55,8 @@ _worker_pool = None  # Worker pool for parallel processing
 _counter_lock = threading.Lock()
 _error_log_file = None  # File to log errors to
 _max_error_threshold = 200  # Maximum number of errors before stopping the program
+_preloaded_chunks = None  # Pre-loaded chunk IDs for generate_questions_from_chunks.py
+_preloaded_chunks_dir = None  # Directory containing pre-loaded chunks (flat structure)
 _openai_client = None  # OpenAI client instance
 
 
@@ -1672,7 +1674,93 @@ def extract_chunks_sequentially(file_map: Dict[str, Dict], chunks_dir: str,
                 _file_map[file_id]['error'] = str(e)
     
     return file_to_chunks
-    
+
+
+def extract_chunks_parallel(file_map: Dict[str, Dict], chunks_dir: str,
+                            chunk_size: int, checkpoint_manager=None, max_workers: int = 8) -> Dict[str, List[str]]:
+    """
+    Extract chunks from multiple files in parallel using ThreadPoolExecutor.
+    Returns a mapping of file IDs to lists of chunk IDs.
+    """
+    global _total_files, _processed_files, _total_chunks, terminal_ui, _exit_requested, _extracted_chunks
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    # Set total files counter
+    _total_files = len(file_map)
+
+    # Create the chunks directory if it doesn't exist
+    ensure_dir_exists(chunks_dir)
+
+    # Map of file IDs to lists of chunk IDs
+    file_to_chunks = {}
+    results_lock = threading.Lock()
+    save_counter = 0
+
+    def process_single_file(file_id, file_info):
+        """Process a single file and return results. No checkpoint saving in workers."""
+        global _exit_requested
+        if _exit_requested:
+            return file_id, [], None
+        try:
+            # Don't pass checkpoint_manager to avoid contention
+            chunk_ids = extract_and_write_chunks(file_id, file_info, chunks_dir,
+                                                chunk_size, None)
+            return file_id, chunk_ids, None
+        except Exception as e:
+            return file_id, [], str(e)
+
+    # Setup progress bar
+    progress_bar = tqdm(total=len(file_map), desc="Extracting chunks (parallel)", unit="file")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        futures = {executor.submit(process_single_file, fid, finfo): fid
+                   for fid, finfo in file_map.items()}
+
+        for future in as_completed(futures):
+            if _exit_requested:
+                log_message("Interrupt detected. Stopping chunk extraction.", log_level="WARNING")
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
+            file_id, chunk_ids, error = future.result()
+
+            with results_lock:
+                if error:
+                    log_message(f"Error extracting chunks from {file_id}: {error}",
+                               log_level="ERROR", error_type="chunk_extraction")
+                    if file_id in _file_map:
+                        _file_map[file_id]['status'] = 'error'
+                        _file_map[file_id]['error'] = error
+                else:
+                    file_to_chunks[file_id] = chunk_ids
+                    _processed_files += 1
+                    _total_chunks += len(chunk_ids)
+
+                    if file_id in _file_map:
+                        _file_map[file_id]['status'] = 'chunked'
+                        _file_map[file_id]['chunks_count'] = len(chunk_ids)
+                        _file_map[file_id]['chunking_time'] = time.time()
+
+                        # Save checkpoint from main thread only, every 50 files
+                        if checkpoint_manager:
+                            checkpoint_manager.add_processed_file(file_id, _file_map[file_id], chunk_ids)
+                            save_counter += 1
+                            if save_counter % 50 == 0:
+                                checkpoint_manager.force_save()
+
+                progress_bar.update(1)
+
+    progress_bar.close()
+
+    # Final checkpoint save
+    if checkpoint_manager:
+        checkpoint_manager.force_save()
+
+    return file_to_chunks
+
 
 def check_content_relevance(chunk_text: str, model_name: str) -> Dict:
     """
@@ -2788,9 +2876,12 @@ def process_chunks_with_parallel_workers(chunk_ids: List[str], chunks_dir: str, 
                 break
                 
             # Read the chunk file - this is I/O handled by the master process
+            # Try flat structure first (for pre-loaded chunks), then subdirectory structure
             chunk_subdir = chunk_id[:2]
-            chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
-            
+            chunk_file_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+            if not os.path.exists(chunk_file_path):
+                chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
+
             try:
                 with open(chunk_file_path, 'r', encoding='utf-8') as f:
                     chunk_text = f.read()
@@ -3159,6 +3250,7 @@ class CheckpointManager:
         return cls._instance
 
     def __init__(self, checkpoint_file: str, force_restart: bool = False):
+        import threading
         self.checkpoint_file = checkpoint_file
         self.last_save_time = 0
         self.save_interval = 10  # Save at least every 10 seconds for better progress tracking
@@ -3170,6 +3262,8 @@ class CheckpointManager:
             'chunks': -1,
             'questions': -1
         }
+        # Thread lock for safe checkpoint saving
+        self._save_lock = threading.Lock()
 
         # Store this instance as the singleton
         CheckpointManager._instance = self
@@ -3355,61 +3449,62 @@ class CheckpointManager:
         """
         Force an immediate save of the checkpoint data to disk, regardless of timing.
         """
-        try:
-            # Create a temporary file first, then rename to avoid corruption
-            temp_file = f"{self.checkpoint_file}.temp"
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.checkpoint_data, f, ensure_ascii=False, indent=2)
+        with self._save_lock:
+            try:
+                # Create a temporary file first, then rename to avoid corruption
+                temp_file = f"{self.checkpoint_file}.temp"
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.checkpoint_data, f, ensure_ascii=False, indent=2)
 
-            # Rename the temp file to the actual checkpoint file
-            # This is more atomic and helps prevent corrupted files
-            import os
-            if os.path.exists(self.checkpoint_file):
-                os.replace(temp_file, self.checkpoint_file)
-            else:
-                os.rename(temp_file, self.checkpoint_file)
+                # Rename the temp file to the actual checkpoint file
+                # This is more atomic and helps prevent corrupted files
+                import os
+                if os.path.exists(self.checkpoint_file):
+                    os.replace(temp_file, self.checkpoint_file)
+                else:
+                    os.rename(temp_file, self.checkpoint_file)
 
-            # Count processed files (only those marked as 'chunked')
-            processed_count = sum(1 for f in self.checkpoint_data['processed_files'].values() 
-                              if f.get('status') == 'chunked')
-            
-            chunks_count = len(self.checkpoint_data['processed_chunks'])
-            questions_count = len(self.checkpoint_data['questions'])
-            
-            # Use log_message instead of print to ensure output goes to the correct pane
-            if hasattr(self, 'question_type') and self.question_type and hasattr(self.question_type, 'value') and self.question_type.value == "rt":
-                label = "traces"
-            else:
-                label = "questions"
+                # Count processed files (only those marked as 'chunked')
+                processed_count = sum(1 for f in self.checkpoint_data['processed_files'].values()
+                                  if f.get('status') == 'chunked')
 
-            # Throttle noisy checkpoint logs: print only if counts changed meaningfully or time elapsed
-            now_ts = time.time()
-            counts_changed = (
-                processed_count != self._last_checkpoint_counts.get('processed') or
-                chunks_count    != self._last_checkpoint_counts.get('chunks') or
-                questions_count != self._last_checkpoint_counts.get('questions')
-            )
-            # Log if at least 15s passed or counts jumped by notable step
-            significant_jump = (
-                abs(chunks_count - self._last_checkpoint_counts.get('chunks', 0)) >= 25 or
-                abs(processed_count - self._last_checkpoint_counts.get('processed', 0)) >= 5
-            )
-            if (now_ts - self._last_checkpoint_log_time) >= 15 or significant_jump:
-                log_message(f"Checkpoint saved: {processed_count} files, {chunks_count} chunks, {questions_count} {label}")
-                self._last_checkpoint_log_time = now_ts
-                self._last_checkpoint_counts = {
-                    'processed': processed_count,
-                    'chunks': chunks_count,
-                    'questions': questions_count
-                }
+                chunks_count = len(self.checkpoint_data['processed_chunks'])
+                questions_count = len(self.checkpoint_data['questions'])
 
-            # Update last save time
-            self.last_save_time = time.time()
-            return True
-        except Exception as e:
-            # Use log_message to ensure error appears in the correct pane
-            log_message(f"Error saving checkpoint: {e}", log_level="ERROR")
-            return False
+                # Use log_message instead of print to ensure output goes to the correct pane
+                if hasattr(self, 'question_type') and self.question_type and hasattr(self.question_type, 'value') and self.question_type.value == "rt":
+                    label = "traces"
+                else:
+                    label = "questions"
+
+                # Throttle noisy checkpoint logs: print only if counts changed meaningfully or time elapsed
+                now_ts = time.time()
+                counts_changed = (
+                    processed_count != self._last_checkpoint_counts.get('processed') or
+                    chunks_count    != self._last_checkpoint_counts.get('chunks') or
+                    questions_count != self._last_checkpoint_counts.get('questions')
+                )
+                # Log if at least 15s passed or counts jumped by notable step
+                significant_jump = (
+                    abs(chunks_count - self._last_checkpoint_counts.get('chunks', 0)) >= 25 or
+                    abs(processed_count - self._last_checkpoint_counts.get('processed', 0)) >= 5
+                )
+                if (now_ts - self._last_checkpoint_log_time) >= 15 or significant_jump:
+                    log_message(f"Checkpoint saved: {processed_count} files, {chunks_count} chunks, {questions_count} {label}")
+                    self._last_checkpoint_log_time = now_ts
+                    self._last_checkpoint_counts = {
+                        'processed': processed_count,
+                        'chunks': chunks_count,
+                        'questions': questions_count
+                    }
+
+                # Update last save time
+                self.last_save_time = time.time()
+                return True
+            except Exception as e:
+                # Use log_message to ensure error appears in the correct pane
+                log_message(f"Error saving checkpoint: {e}", log_level="ERROR")
+                return False
 
     def save(self):
         """
@@ -3769,160 +3864,128 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                 model_name=model_name
             )
             
-        # STEP 1: Map input files and create unique identifiers
-        log_message(f"Step 1: Mapping input files in {input_dir}")
-        if terminal_ui and _use_split_screen:
-            terminal_ui.update_stats(status_message=f"Mapping input files...")
-        
-        start_time = time.time()
-        
-        # Load already processed files from checkpoint
-        processed_files = checkpoint_manager.get_processed_files()
-        processed_chunks = checkpoint_manager.get_processed_chunks()
-        
-        # Load error statistics from checkpoint
-        error_stats = checkpoint_manager.get_error_stats()
-        
-        # Update the UI with error stats from checkpoint if available
-        if terminal_ui and _use_split_screen:
-            # Update all the error statistics
-            terminal_ui.update_stats(
-                error_file_processing=error_stats.get('error_file_processing', 0),
-                error_chunk_extraction=error_stats.get('error_chunk_extraction', 0),
-                error_chunk_reading=error_stats.get('error_chunk_reading', 0),
-                error_summarizing=error_stats.get('error_summarizing', 0),
-                error_question_gen=error_stats.get('error_question_gen', 0),
-                error_question_eval=error_stats.get('error_question_eval', 0),
-                error_api=error_stats.get('error_api', 0),
-                error_other=error_stats.get('error_other', 0),
-                low_score_questions=error_stats.get('low_score_questions', 0),
-                total_errors=error_stats.get('total_errors', 0)
-            )
-            
-        # Load counter statistics from checkpoint
-        counter_stats = checkpoint_manager.get_counter_stats()
-        
-        # Update global counters from checkpoint atomically
-        with _counter_lock:
-            # Initialize counters with values from checkpoint
-            _extracted_chunks = counter_stats.get('extracted_chunks', 0)
-            _processed_chunks = counter_stats.get('processed_chunks', 0)
-            
-            # We'll set _total_chunks later after we've analyzed all files
-            
-        # Update global chunk map from checkpoint
-        for chunk_id, chunk_data in processed_chunks.items():
-            _chunk_map[chunk_id] = chunk_data
-        
-        # Initialize file map
-        if recursive:
-            log_message("Recursively searching for files (including ZIP archives)...")
+        # Check for pre-loaded chunks FIRST (from generate_questions_from_chunks.py)
+        # Skip Steps 1 and 2 entirely if we have pre-loaded chunks
+        _using_preloaded_chunks = _preloaded_chunks is not None
+
+        if _using_preloaded_chunks:
+            log_message(f"Using {len(_preloaded_chunks)} pre-loaded chunks, skipping file discovery and extraction")
             if terminal_ui and _use_split_screen:
-                terminal_ui.update_stats(status_message="Recursively searching for files (including ZIP archives)...")
-        else:
-            log_message("Searching for files (including ZIP archives)...")
+                terminal_ui.update_stats(status_message=f"Using {len(_preloaded_chunks)} pre-loaded chunks")
+
+            # Set up for pre-loaded chunks
+            file_to_chunks = {'preloaded': _preloaded_chunks}
+            chunks_dir = _preloaded_chunks_dir or chunks_dir
+
+            # Load checkpoint data for chunk processing
+            processed_files = checkpoint_manager.get_processed_files()
+            processed_chunks = checkpoint_manager.get_processed_chunks()
+            error_stats = checkpoint_manager.get_error_stats()
+            counter_stats = checkpoint_manager.get_counter_stats()
+
+            # Update global chunk map from checkpoint
+            for chunk_id, chunk_data in processed_chunks.items():
+                _chunk_map[chunk_id] = chunk_data
+
+            # Update counters
+            with _counter_lock:
+                _extracted_chunks = counter_stats.get('extracted_chunks', 0)
+                _processed_chunks = counter_stats.get('processed_chunks', 0)
+
+        # STEP 1: Map input files and create unique identifiers (skip if using preloaded chunks)
+        if not _using_preloaded_chunks:
+            log_message(f"Step 1: Mapping input files in {input_dir}")
             if terminal_ui and _use_split_screen:
-                terminal_ui.update_stats(status_message="Searching for files (including ZIP archives)...")
-        
-        file_tuples = find_files_recursively(input_dir, ['.pdf', '.txt', '.md'])
-        log_message(f"File discovery: found {len(file_tuples)} files with supported extensions", log_level="INFO")
-        
-        # Log ZIP file discovery
-        zip_files = [f for f in file_tuples if "::" in f[1]]
-        if zip_files:
-            log_message(f"Found {len(zip_files)} files inside ZIP archives")
-            # Show some examples
-            for i, (rel_path, abs_path) in enumerate(zip_files[:3]):
-                zip_path, file_in_zip = abs_path.split("::", 1)
-                log_message(f"  Example: {os.path.basename(zip_path)}/{file_in_zip}")
-            if len(zip_files) > 3:
-                log_message(f"  ... and {len(zip_files) - 3} more files in ZIP archives")
-        
-        # Create file map
-        for rel_path, abs_path in file_tuples:
-            file_id = generate_file_id(abs_path)
-            # Skip if this file is already fully processed
-            if file_id in processed_files and processed_files[file_id].get('status') == 'chunked':
-                log_message(f"File {os.path.basename(abs_path)} already processed, loading from checkpoint")
-                _file_map[file_id] = processed_files[file_id]
-                
-                # Increment counter in a thread-safe way
-                with _counter_lock:
-                    _processed_files += 1
-                
-                # Update the UI to show the correct file count
+                terminal_ui.update_stats(status_message=f"Mapping input files...")
+
+            start_time = time.time()
+
+            # Load already processed files from checkpoint (already loaded above for preloaded chunks)
+            processed_files = checkpoint_manager.get_processed_files()
+            processed_chunks = checkpoint_manager.get_processed_chunks()
+
+            # Load error statistics from checkpoint
+            error_stats = checkpoint_manager.get_error_stats()
+
+            # Update the UI with error stats from checkpoint if available
+            if terminal_ui and _use_split_screen:
+                # Update all the error statistics
+                terminal_ui.update_stats(
+                    error_file_processing=error_stats.get('error_file_processing', 0),
+                    error_chunk_extraction=error_stats.get('error_chunk_extraction', 0),
+                    error_chunk_reading=error_stats.get('error_chunk_reading', 0),
+                    error_summarizing=error_stats.get('error_summarizing', 0),
+                    error_question_gen=error_stats.get('error_question_gen', 0),
+                    error_question_eval=error_stats.get('error_question_eval', 0),
+                    error_api=error_stats.get('error_api', 0),
+                    error_other=error_stats.get('error_other', 0),
+                    low_score_questions=error_stats.get('low_score_questions', 0),
+                    total_errors=error_stats.get('total_errors', 0)
+                )
+
+            # Load counter statistics from checkpoint
+            counter_stats = checkpoint_manager.get_counter_stats()
+
+            # Update global counters from checkpoint atomically
+            with _counter_lock:
+                # Initialize counters with values from checkpoint
+                _extracted_chunks = counter_stats.get('extracted_chunks', 0)
+                _processed_chunks = counter_stats.get('processed_chunks', 0)
+
+                # We'll set _total_chunks later after we've analyzed all files
+
+            # Update global chunk map from checkpoint
+            for chunk_id, chunk_data in processed_chunks.items():
+                _chunk_map[chunk_id] = chunk_data
+
+            # Initialize file map
+            if recursive:
+                log_message("Recursively searching for files (including ZIP archives)...")
                 if terminal_ui and _use_split_screen:
-                    # Force immediate stats update to ensure UI is in sync with counters
-                    terminal_ui.update_stats(files_processed=_processed_files)
-                    update_global_stats()
-                
-                continue
+                    terminal_ui.update_stats(status_message="Recursively searching for files (including ZIP archives)...")
             else:
-                # Handle ZIP file paths
-                if "::" in abs_path:
-                    # This is a file inside a ZIP
+                log_message("Searching for files (including ZIP archives)...")
+                if terminal_ui and _use_split_screen:
+                    terminal_ui.update_stats(status_message="Searching for files (including ZIP archives)...")
+
+            file_tuples = find_files_recursively(input_dir, ['.pdf', '.txt', '.md'])
+            log_message(f"File discovery: found {len(file_tuples)} files with supported extensions", log_level="INFO")
+
+            # Log ZIP file discovery
+            zip_files = [f for f in file_tuples if "::" in f[1]]
+            if zip_files:
+                log_message(f"Found {len(zip_files)} files inside ZIP archives")
+                # Show some examples
+                for i, (rel_path, abs_path) in enumerate(zip_files[:3]):
                     zip_path, file_in_zip = abs_path.split("::", 1)
-                    file_name = os.path.basename(file_in_zip)
-                    file_ext = os.path.splitext(file_in_zip)[1].lower()[1:]
-                    # Get size from ZIP file info
-                    try:
-                        with zipfile.ZipFile(zip_path, 'r') as zip_file:
-                            file_info = zip_file.getinfo(file_in_zip)
-                            file_size = file_info.file_size
-                            file_time = file_info.date_time
-                            # Convert ZIP time to timestamp
-                            import datetime
-                            file_timestamp = datetime.datetime(*file_time).timestamp()
-                    except Exception as e:
-                        log_message(f"Error getting ZIP file info for {abs_path}: {e}", log_level="WARNING")
-                        file_size = 0
-                        file_timestamp = time.time()
+                    log_message(f"  Example: {os.path.basename(zip_path)}/{file_in_zip}")
+                if len(zip_files) > 3:
+                    log_message(f"  ... and {len(zip_files) - 3} more files in ZIP archives")
+
+            # Create file map
+            for rel_path, abs_path in file_tuples:
+                file_id = generate_file_id(abs_path)
+                # Skip if this file is already fully processed
+                if file_id in processed_files and processed_files[file_id].get('status') == 'chunked':
+                    log_message(f"File {os.path.basename(abs_path)} already processed, loading from checkpoint")
+                    _file_map[file_id] = processed_files[file_id]
+
+                    # Increment counter in a thread-safe way
+                    with _counter_lock:
+                        _processed_files += 1
+
+                    # Update the UI to show the correct file count
+                    if terminal_ui and _use_split_screen:
+                        # Force immediate stats update to ensure UI is in sync with counters
+                        terminal_ui.update_stats(files_processed=_processed_files)
+                        update_global_stats()
+
+                    continue
                 else:
-                    # Regular file
-                    file_name = os.path.basename(abs_path)
-                    file_ext = os.path.splitext(abs_path)[1].lower()[1:]
-                    file_size = os.path.getsize(abs_path)
-                    file_timestamp = os.path.getmtime(abs_path)
-                
-                # Add file to map (both ZIP and regular files)
-                _file_map[file_id] = {
-                    'file_path': abs_path,
-                    'relative_path': rel_path,
-                    'filename': file_name,
-                    'size': file_size,
-                    'last_modified': file_timestamp,
-                    'type': file_ext,
-                    'status': 'pending',
-                    'discovery_time': time.time()
-                }
-        else:
-            # Only look at files in the input directory
-            for filename in os.listdir(input_dir):
-                if filename.lower().endswith(('.pdf', '.txt', '.md')):
-                    file_path = os.path.join(input_dir, filename)
-                    file_id = generate_file_id(file_path)
-                    
-                    # Skip if this file is already fully processed
-                    if file_id in processed_files and processed_files[file_id].get('status') == 'chunked':
-                        log_message(f"File {filename} already processed, loading from checkpoint")
-                        _file_map[file_id] = processed_files[file_id]
-                        
-                        # Increment counter in a thread-safe way
-                        with _counter_lock:
-                            _processed_files += 1
-                        
-                        # Update the UI to show the correct file count
-                        if terminal_ui and _use_split_screen:
-                            # Force immediate stats update to ensure UI is in sync with counters
-                            terminal_ui.update_stats(files_processed=_processed_files)
-                            update_global_stats()
-                            
-                        continue
-                        
                     # Handle ZIP file paths
-                    if "::" in file_path:
+                    if "::" in abs_path:
                         # This is a file inside a ZIP
-                        zip_path, file_in_zip = file_path.split("::", 1)
+                        zip_path, file_in_zip = abs_path.split("::", 1)
                         file_name = os.path.basename(file_in_zip)
                         file_ext = os.path.splitext(file_in_zip)[1].lower()[1:]
                         # Get size from ZIP file info
@@ -3935,19 +3998,20 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                                 import datetime
                                 file_timestamp = datetime.datetime(*file_time).timestamp()
                         except Exception as e:
-                            log_message(f"Error getting ZIP file info for {file_path}: {e}", log_level="WARNING")
+                            log_message(f"Error getting ZIP file info for {abs_path}: {e}", log_level="WARNING")
                             file_size = 0
                             file_timestamp = time.time()
                     else:
                         # Regular file
-                        file_name = filename
-                        file_ext = os.path.splitext(filename)[1].lower()[1:]
-                        file_size = os.path.getsize(file_path)
-                        file_timestamp = os.path.getmtime(file_path)
-                    
+                        file_name = os.path.basename(abs_path)
+                        file_ext = os.path.splitext(abs_path)[1].lower()[1:]
+                        file_size = os.path.getsize(abs_path)
+                        file_timestamp = os.path.getmtime(abs_path)
+
+                    # Add file to map (both ZIP and regular files)
                     _file_map[file_id] = {
-                        'file_path': file_path,
-                        'relative_path': filename,
+                        'file_path': abs_path,
+                        'relative_path': rel_path,
                         'filename': file_name,
                         'size': file_size,
                         'last_modified': file_timestamp,
@@ -3955,99 +4019,104 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                         'status': 'pending',
                         'discovery_time': time.time()
                     }
-        
-        # Get file counters from checkpoint
-        file_count_from_checkpoint = counter_stats.get('total_files', 0)
-        processed_count_from_checkpoint = counter_stats.get('processed_files', 0)
-        
-        # Calculate current files in the map
-        current_map_files = len(_file_map)
-        
-        # Determine the total files, prioritizing the checkpoint value if it's higher
-        # This ensures we don't lose count of files that might not be in the current directory 
-        _total_files = max(file_count_from_checkpoint, current_map_files)
-        
-        # Initialize processed files from checkpoint
-        _processed_files = processed_count_from_checkpoint
-        
-        # Update UI with initial file counts immediately
-        if terminal_ui and _use_split_screen:
-            terminal_ui.update_stats(
-                total_files=_total_files,
-                files_processed=_processed_files
-            )
-        
-        # Count files that are fully processed (chunked)
-        # First count files marked as processed in current file map
-        processed_count = 0  # Track count locally first
-        for file_id, file_info in _file_map.items():
-            if file_info.get('status') == 'chunked':
-                processed_count += 1
-        
-        # Update counter atomically
-        with _counter_lock:
-            _processed_files += processed_count
-                
-        # Then add files from checkpoint that aren't in current map
-        # but were processed in a previous run
-        checkpoint_count = 0  # Track checkpoint files count locally first
-        for file_id, file_info in processed_files.items():
-            if file_id not in _file_map and file_info.get('status') == 'chunked':
-                checkpoint_count += 1
-        
-        # Update counter atomically
-        with _counter_lock:
-            _processed_files += checkpoint_count
-                
-        # Update the UI with the final counts and recalculate completion percentage
-        if terminal_ui and _use_split_screen:
-            # Calculate progress percentage for UI display
-            file_progress = min(100.0, (_processed_files / max(1, _total_files)) * 100)
-            
-            # Update the UI with all counts
-            terminal_ui.update_stats(
-                files_processed=_processed_files,
-                total_files=_total_files,
-                completion_percentage=file_progress
-            )
-            # Force an update_global_stats call to ensure consistent display
-            update_global_stats()
-        
-        # Count files that still need processing (in current map but not chunked)
-        unprocessed_files = sum(1 for file_info in _file_map.values() if file_info.get('status') != 'chunked')
-        mapping_time = time.time() - start_time
-        
-        # Calculate total files that need processing (includes undetected files from previous runs)
-        total_unprocessed = _total_files - _processed_files
-        
-        log_message(f"Found {_total_files} files total ({_processed_files} already processed, {total_unprocessed} need processing) in {human_readable_time(mapping_time)}")
-        
-        # Update global stats in UI with consistent values
-        if terminal_ui and _use_split_screen:
-            # Calculate progress percentage for UI display again to ensure consistency
-            file_progress = min(100.0, (_processed_files / max(1, _total_files)) * 100)
-            
-            terminal_ui.update_stats(
-                total_files=_total_files,
-                files_processed=_processed_files,
-                completion_percentage=file_progress,
-                status_message=f"Found {_total_files} files, {total_unprocessed} need processing"
-            )
-            # Make sure global stats and UI are in sync
-            update_global_stats()
-        
-        # Filter file map to only include unprocessed files
-        files_to_process = {
-            file_id: file_info for file_id, file_info in _file_map.items() 
-            if file_info.get('status') != 'chunked'
-        }
-        
+            # End of for loop for recursive file tuples
+
+            # Get file counters from checkpoint
+            file_count_from_checkpoint = counter_stats.get('total_files', 0)
+            processed_count_from_checkpoint = counter_stats.get('processed_files', 0)
+
+            # Calculate current files in the map
+            current_map_files = len(_file_map)
+
+            # Determine the total files, prioritizing the checkpoint value if it's higher
+            # This ensures we don't lose count of files that might not be in the current directory
+            _total_files = max(file_count_from_checkpoint, current_map_files)
+
+            # Initialize processed files from checkpoint
+            _processed_files = processed_count_from_checkpoint
+
+            # Update UI with initial file counts immediately
+            if terminal_ui and _use_split_screen:
+                terminal_ui.update_stats(
+                    total_files=_total_files,
+                    files_processed=_processed_files
+                )
+
+            # Count files that are fully processed (chunked)
+            # First count files marked as processed in current file map
+            processed_count = 0  # Track count locally first
+            for file_id, file_info in _file_map.items():
+                if file_info.get('status') == 'chunked':
+                    processed_count += 1
+
+            # Update counter atomically
+            with _counter_lock:
+                _processed_files += processed_count
+
+            # Then add files from checkpoint that aren't in current map
+            # but were processed in a previous run
+            checkpoint_count = 0  # Track checkpoint files count locally first
+            for file_id, file_info in processed_files.items():
+                if file_id not in _file_map and file_info.get('status') == 'chunked':
+                    checkpoint_count += 1
+
+            # Update counter atomically
+            with _counter_lock:
+                _processed_files += checkpoint_count
+
+            # Update the UI with the final counts and recalculate completion percentage
+            if terminal_ui and _use_split_screen:
+                # Calculate progress percentage for UI display
+                file_progress = min(100.0, (_processed_files / max(1, _total_files)) * 100)
+
+                # Update the UI with all counts
+                terminal_ui.update_stats(
+                    files_processed=_processed_files,
+                    total_files=_total_files,
+                    completion_percentage=file_progress
+                )
+                # Force an update_global_stats call to ensure consistent display
+                update_global_stats()
+
+            # Count files that still need processing (in current map but not chunked)
+            unprocessed_files = sum(1 for file_info in _file_map.values() if file_info.get('status') != 'chunked')
+            mapping_time = time.time() - start_time
+
+            # Calculate total files that need processing (includes undetected files from previous runs)
+            total_unprocessed = _total_files - _processed_files
+
+            log_message(f"Found {_total_files} files total ({_processed_files} already processed, {total_unprocessed} need processing) in {human_readable_time(mapping_time)}")
+
+            # Update global stats in UI with consistent values
+            if terminal_ui and _use_split_screen:
+                # Calculate progress percentage for UI display again to ensure consistency
+                file_progress = min(100.0, (_processed_files / max(1, _total_files)) * 100)
+
+                terminal_ui.update_stats(
+                    total_files=_total_files,
+                    files_processed=_processed_files,
+                    completion_percentage=file_progress,
+                    status_message=f"Found {_total_files} files, {total_unprocessed} need processing"
+                )
+                # Make sure global stats and UI are in sync
+                update_global_stats()
+
+            # Filter file map to only include unprocessed files
+            files_to_process = {
+                file_id: file_info for file_id, file_info in _file_map.items()
+                if file_info.get('status') != 'chunked'
+            }
+
+        # Check for pre-loaded chunks (from generate_questions_from_chunks.py) - use flag set earlier
+        if _using_preloaded_chunks:
+            # file_to_chunks and chunks_dir already set at the top of this function
+            pass
         # Check if there are any unprocessed files (using our calculated total)
-        if _processed_files == _total_files:
+        elif _processed_files == _total_files:
             log_message("All files already processed according to checkpoint.")
             if terminal_ui and _use_split_screen:
                 terminal_ui.update_stats(status_message="All files already processed, loading chunks from checkpoint")
-                
+
             # Rebuild file_to_chunks from checkpoint
             file_to_chunks = {}
             for chunk_id, chunk_data in processed_chunks.items():
@@ -4067,10 +4136,17 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
             # Make sure the chunks directory exists
             ensure_dir_exists(chunks_dir)
             
-            # Create a file_to_chunks mapping - process one file at a time
-            file_to_chunks = extract_chunks_sequentially(
-                files_to_process, chunks_dir, chunk_size, checkpoint_manager
-            )
+            # Create a file_to_chunks mapping - use parallel extraction if workers > 1
+            parallel_workers = _max_workers if _max_workers and _max_workers > 1 else 8
+            if parallel_workers > 1:
+                log_message(f"Using parallel chunk extraction with {parallel_workers} workers")
+                file_to_chunks = extract_chunks_parallel(
+                    files_to_process, chunks_dir, chunk_size, checkpoint_manager, max_workers=parallel_workers
+                )
+            else:
+                file_to_chunks = extract_chunks_sequentially(
+                    files_to_process, chunks_dir, chunk_size, checkpoint_manager
+                )
             
             chunk_extraction_time = time.time() - chunk_extraction_start
             
@@ -4185,7 +4261,8 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
                 checkpoint_manager=checkpoint_manager,
                 output_file=output_file,
                 max_concurrent_calls=args.max_concurrent_calls,
-                file_map=_file_map  # Pass the global file map
+                file_map=_file_map,  # Pass the global file map
+                terminal_ui=terminal_ui  # Pass terminal UI for progress updates
             )
             
             # Write results to output file (enhanced processing doesn't do this automatically)
@@ -4600,7 +4677,7 @@ def parse_arguments():
     parser.add_argument('--output', default='output.json', help='Output JSON file (default: output.json)')
     parser.add_argument('--chunks-dir', default='chunks', 
                         help='Directory to store extracted chunks. If using default, the name will be based on output file name (e.g., output_name_chunks)')
-    parser.add_argument('--model', default='llama', help='Model shortname from model configuration file to use')
+    parser.add_argument('--model', default='gpt41', help='Model shortname from model configuration file to use')
     parser.add_argument('--config', default='model_servers.yaml', 
                        help='Path to model configuration file (default: model_servers.yaml)')
     parser.add_argument('--chunk-size', type=int, default=500, help='Approximate number of words per chunk (default: 500)')

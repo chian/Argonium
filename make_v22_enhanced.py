@@ -547,9 +547,9 @@ class EnhancedAPIManager:
 
 class EnhancedChunkProcessor:
     """High-performance chunk processor with failure tracking and retry logic"""
-    
-    def __init__(self, model_name: str, max_concurrent_calls: int = 100, 
-                 max_retries: int = 3, failure_log_file: str = None):
+
+    def __init__(self, model_name: str, max_concurrent_calls: int = 100,
+                 max_retries: int = 3, failure_log_file: str = None, terminal_ui=None):
         self.model_name = model_name
         self.max_concurrent_calls = max_concurrent_calls
         self.failure_tracker = EnhancedFailureTracker(max_retries, failure_log_file)
@@ -557,6 +557,11 @@ class EnhancedChunkProcessor:
         self.output_file = None  # Will be set during processing
         self.checkpoint_lock = asyncio.Lock()  # Lock for checkpoint file access
         self._file_map = {}  # Will store chunk_id -> source_info mapping
+        self.terminal_ui = terminal_ui  # Curses UI for progress updates
+        self._last_ui_update = 0  # Throttle UI updates
+        self._processed_count = 0  # Track processed chunks for UI
+        self._total_chunks = 0  # Total chunks for UI
+        self._questions_generated = 0  # Questions generated for UI
         
     def _get_source_info_from_chunk_id(self, chunk_id: str) -> dict:
         """Get source file information from chunk_id"""
@@ -600,7 +605,36 @@ class EnhancedChunkProcessor:
             # Write back to file
             with open(self.output_file, 'w', encoding='utf-8') as f:
                 json.dump(existing_questions, f, ensure_ascii=False, indent=2)
-        
+
+    def _update_terminal_ui(self, force: bool = False):
+        """Update the curses terminal UI with current progress (throttled to every 0.5s)"""
+        if not self.terminal_ui:
+            return
+
+        current_time = time.time()
+        if not force and (current_time - self._last_ui_update) < 0.5:
+            return
+
+        self._last_ui_update = current_time
+
+        # Calculate completion percentage
+        completion_pct = (self._processed_count / max(1, self._total_chunks)) * 100
+
+        # Calculate success rate
+        total_attempts = self._processed_count + len(self.failure_tracker.get_failed_chunks())
+        success_rate = (self._processed_count / max(1, total_attempts)) * 100 if total_attempts > 0 else 100.0
+
+        # Update the terminal UI stats
+        self.terminal_ui.update_stats(
+            chunks_processed=self._processed_count,
+            total_chunks=self._total_chunks,
+            questions_generated=self._questions_generated,
+            completion_percentage=completion_pct,
+            success_rate=success_rate,
+            active_workers=len(self.failure_tracker.get_failed_chunks()),  # Approximate
+            status_message="Processing chunks..."
+        )
+
     async def process_chunks_enhanced(self, chunk_ids: List[str], chunks_dir: str,
                                     question_type: str, num_answers: int = 7, 
                                     min_score: int = 7, checkpoint_manager=None, output_file: str = None) -> List[Dict]:
@@ -626,7 +660,12 @@ class EnhancedChunkProcessor:
         self.stats.total_chunks = len(all_chunks)
         self.stats.start_time = time.time()
         self.output_file = output_file  # Store for incremental saving
-        
+
+        # Initialize UI tracking variables
+        self._total_chunks = len(all_chunks)
+        self._processed_count = 0
+        self._questions_generated = 0
+
         print(f"Processing {len(all_chunks)} chunks with up to {self.max_concurrent_calls} concurrent API calls")
         print(f"Including {len(retryable_chunks)} chunks from previous failures")
         # Load model configuration from YAML
@@ -654,10 +693,12 @@ class EnhancedChunkProcessor:
                 async with chunk_semaphore:
                     if 0: print(f"DEBUG: ACQUIRED semaphore for {chunk_id}")
                     if 0: print(f"DEBUG: Processing chunk {chunk_id}")
-                    # Read chunk file
+                    # Read chunk file - try flat structure first (for pre-loaded chunks), then subdirectory
                     chunk_subdir = chunk_id[:2]
-                    chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
-                    
+                    chunk_file_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+                    if not os.path.exists(chunk_file_path):
+                        chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
+
                     with open(chunk_file_path, 'r', encoding='utf-8') as f:
                         chunk_text = f.read()
                     if 0: print(f"DEBUG: Read chunk {chunk_id}, length: {len(chunk_text)}")
@@ -737,13 +778,18 @@ class EnhancedChunkProcessor:
                         # Clean up start time tracking
                         if task in in_flight_start_times:
                             del in_flight_start_times[task]
-                        
+
                         res = await task
+                        self._processed_count += 1
                         if res:
                             results.append(res)
                             new_results.append(res)
+                            self._questions_generated += 1
                         pbar.update(1)
-                    
+
+                    # Update terminal UI with progress
+                    self._update_terminal_ui()
+
                     # Save new results to output file immediately
                     if new_results and self.output_file:
                         await self.save_results_incrementally(new_results)
@@ -823,11 +869,11 @@ async def process_chunks_with_enhanced_parallel_workers(
     chunk_ids: List[str], chunks_dir: str, model_name: str,
     question_type: str, num_answers: int, min_score: int,
     checkpoint_manager, output_file: str, max_concurrent_calls: int = 100,
-    file_map: dict = None
+    file_map: dict = None, terminal_ui=None
 ) -> List[Dict]:
     """
     Enhanced chunk processing with high parallelism and failure tracking
-    
+
     Args:
         chunk_ids: List of chunk IDs to process
         chunks_dir: Directory containing chunk files
@@ -838,14 +884,16 @@ async def process_chunks_with_enhanced_parallel_workers(
         checkpoint_manager: Checkpoint manager for progress saving
         output_file: Output file path
         max_concurrent_calls: Maximum concurrent API calls
+        terminal_ui: Optional curses terminal UI for progress updates
     """
-    
+
     processor = EnhancedChunkProcessor(
         model_name=model_name,
         max_concurrent_calls=max_concurrent_calls,
-        failure_log_file=f"failures_{os.path.basename(output_file)}.json"
+        failure_log_file=f"failures_{os.path.basename(output_file)}.json",
+        terminal_ui=terminal_ui
     )
-    
+
     # Set the file map if provided
     if file_map:
         processor._file_map = file_map
@@ -866,14 +914,14 @@ async def process_chunks_with_enhanced_parallel_workers(
 def run_enhanced_processing(chunk_ids: List[str], chunks_dir: str, model_name: str,
                         question_type: str, num_answers: int, min_score: int,
                         checkpoint_manager, output_file: str, max_concurrent_calls: int = 100,
-                        file_map: dict = None):
+                        file_map: dict = None, terminal_ui=None):
     """
     Synchronous wrapper for enhanced async processing
     """
     return asyncio.run(
         process_chunks_with_enhanced_parallel_workers(
-            chunk_ids, chunks_dir, model_name, question_type, 
-            num_answers, min_score, checkpoint_manager, output_file, max_concurrent_calls, file_map
+            chunk_ids, chunks_dir, model_name, question_type,
+            num_answers, min_score, checkpoint_manager, output_file, max_concurrent_calls, file_map, terminal_ui
         )
     )
 

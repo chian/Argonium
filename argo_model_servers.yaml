@@ -2,7 +2,6 @@
 # Last updated: 2025-05-24
 
 servers:
-
 - server: argo-bridge
   shortname: gpt41
   openai_api_key: api+key
