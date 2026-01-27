@@ -242,10 +242,8 @@ class EnhancedAPIManager:
         self.api_key = api_key
         self.base_url = base_url
         
-        # Semaphore to limit concurrent API calls
-        self.semaphore = asyncio.Semaphore(max_concurrent_calls)
-
-        # ThreadPoolExecutor sized to match concurrency for run_in_executor calls
+        # ThreadPoolExecutor is the single concurrency control
+        # It limits how many sync functions can run in parallel
         from concurrent.futures import ThreadPoolExecutor
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent_calls)
 
@@ -344,28 +342,27 @@ class EnhancedAPIManager:
         on_giveup=lambda details: None
     )
     async def make_api_call(self, messages: List[Dict], **kwargs) -> Dict:
-        """Make a single API call with retry logic and rate limiting"""
-        async with self.semaphore:  # Limit concurrent calls
-            self.stats.api_calls_made += 1
-            token = uuid.uuid4().hex
-            start_ts = time.time()
-            await self._increment_in_flight(token, start_ts)
-            
-            response = await self.async_client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                **kwargs
-            )
-            
-            # Convert to dict for compatibility
-            if hasattr(response, 'model_dump'):
-                result = response.model_dump()
-            else:
-                result = response
-            # Success bucket
-            self._status_buckets['2xx'] += 1
-            self._status_window_maybe_reset()
-            return result
+        """Make a single API call with retry logic"""
+        self.stats.api_calls_made += 1
+        token = uuid.uuid4().hex
+        start_ts = time.time()
+        await self._increment_in_flight(token, start_ts)
+
+        response = await self.async_client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            **kwargs
+        )
+
+        # Convert to dict for compatibility
+        if hasattr(response, 'model_dump'):
+            result = response.model_dump()
+        else:
+            result = response
+        # Success bucket
+        self._status_buckets['2xx'] += 1
+        self._status_window_maybe_reset()
+        return result
     
     async def process_chunk_parallel(self, chunk_id: str, chunk_text: str, 
                                    question_type: str, num_answers: int = 7, 
@@ -685,9 +682,6 @@ class EnhancedChunkProcessor:
             api_key=api_key,
             base_url=base_url
         ) as api_manager:
-            # Create semaphore for chunk-level concurrency - set high to avoid double-throttling
-            # API manager already has its own semaphore for actual API calls
-            chunk_semaphore = asyncio.Semaphore(len(all_chunks))  # Allow all chunks to start
             # Watchdog and health tracking
             last_completion_ts = time.time()
             last_health_write_ts = time.time()
@@ -697,56 +691,54 @@ class EnhancedChunkProcessor:
             async def process_single_chunk(chunk_id: str) -> Optional[Dict]:
                 """Process a single chunk with error handling"""
                 if 0: print(f"DEBUG: ENTERING process_single_chunk for {chunk_id}")
-                async with chunk_semaphore:
-                    if 0: print(f"DEBUG: ACQUIRED semaphore for {chunk_id}")
-                    if 0: print(f"DEBUG: Processing chunk {chunk_id}")
-                    # Read chunk file - try flat structure first (for pre-loaded chunks), then subdirectory
-                    chunk_subdir = chunk_id[:2]
-                    chunk_file_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
-                    if not os.path.exists(chunk_file_path):
-                        chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
+                if 0: print(f"DEBUG: Processing chunk {chunk_id}")
+                # Read chunk file - try flat structure first (for pre-loaded chunks), then subdirectory
+                chunk_subdir = chunk_id[:2]
+                chunk_file_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+                if not os.path.exists(chunk_file_path):
+                    chunk_file_path = os.path.join(chunks_dir, chunk_subdir, f"{chunk_id}.txt")
 
-                    with open(chunk_file_path, 'r', encoding='utf-8') as f:
-                        chunk_text = f.read()
-                    if 0: print(f"DEBUG: Read chunk {chunk_id}, length: {len(chunk_text)}")
-                    
-                    if 0: print(f"DEBUG: About to call process_chunk_parallel for {chunk_id}")
-                    result = await api_manager.process_chunk_parallel(
-                        chunk_id, chunk_text, question_type, num_answers, min_score
+                with open(chunk_file_path, 'r', encoding='utf-8') as f:
+                    chunk_text = f.read()
+                if 0: print(f"DEBUG: Read chunk {chunk_id}, length: {len(chunk_text)}")
+
+                if 0: print(f"DEBUG: About to call process_chunk_parallel for {chunk_id}")
+                result = await api_manager.process_chunk_parallel(
+                    chunk_id, chunk_text, question_type, num_answers, min_score
+                )
+                if 0: print(f"DEBUG: process_chunk_parallel returned for {chunk_id}: {type(result)}, status={result.get('status') if result else None}")
+
+                # Add source file information from the file map
+                if result and hasattr(self, '_file_map') and self._file_map:
+                    source_info = self._get_source_info_from_chunk_id(chunk_id)
+                    if source_info:
+                        result.update(source_info)
+
+                if result.get('status') == 'error':
+                    self.failure_tracker.record_failure(
+                        chunk_id, "processing", result.get('error', 'Unknown error'),
+                        "chunk_processing"
                     )
-                    if 0: print(f"DEBUG: process_chunk_parallel returned for {chunk_id}: {type(result)}, status={result.get('status') if result else None}")
-                    
-                    # Add source file information from the file map
-                    if result and hasattr(self, '_file_map') and self._file_map:
-                        source_info = self._get_source_info_from_chunk_id(chunk_id)
-                        if source_info:
-                            result.update(source_info)
-                    
-                    if result.get('status') == 'error':
-                        self.failure_tracker.record_failure(
-                            chunk_id, "processing", result.get('error', 'Unknown error'), 
-                            "chunk_processing"
-                        )
-                        return None
-                    elif result.get('status') in ['success', 'completed']:
-                        self.stats.completed_chunks += 1
-                        
-                        # Save to checkpoint with async lock to prevent blocking
-                        if checkpoint_manager:
-                            async with self.checkpoint_lock:
-                                checkpoint_manager.update_processed_chunk(chunk_id, result)
-                        
-                        return result
-                    else:
-                        # Filtered or low quality - not an error but no result
-                        self.stats.completed_chunks += 1
-                        
-                        # Save filtered chunks to checkpoint so they aren't reprocessed
-                        if checkpoint_manager and result:
-                            async with self.checkpoint_lock:
-                                checkpoint_manager.update_processed_chunk(chunk_id, result)
-                        
-                        return None
+                    return None
+                elif result.get('status') in ['success', 'completed']:
+                    self.stats.completed_chunks += 1
+
+                    # Save to checkpoint with async lock to prevent blocking
+                    if checkpoint_manager:
+                        async with self.checkpoint_lock:
+                            checkpoint_manager.update_processed_chunk(chunk_id, result)
+
+                    return result
+                else:
+                    # Filtered or low quality - not an error but no result
+                    self.stats.completed_chunks += 1
+
+                    # Save filtered chunks to checkpoint so they aren't reprocessed
+                    if checkpoint_manager and result:
+                        async with self.checkpoint_lock:
+                            checkpoint_manager.update_processed_chunk(chunk_id, result)
+
+                    return None
             
             # Create progress bar
             with tqdm(total=len(all_chunks), desc="Processing chunks") as pbar:
