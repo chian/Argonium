@@ -2200,10 +2200,26 @@ def generate_multiple_choice_qa_pairs(chunk_id: str, chunk_text: str, model_name
     # Use our target position regardless of what AI reported (for uniform distribution)
     correct_answer_number = target_correct_position
     correct_index = correct_answer_number - 1  # Convert from 1-based to 0-based
-    
+
+    # Safety check: ensure we have enough answers
+    if len(answers) == 0:
+        log_message(f"Chunk {chunk_id}: No answers extracted from model output", log_level="ERROR", error_type="parse_error")
+        return {
+            'chunk_id': chunk_id,
+            'error': "No answers extracted from model output",
+            'status': 'error',
+            'processing_time': time.time() - start_time
+        }
+
+    # Clamp correct_index to valid range if model returned fewer answers
+    if correct_index >= len(answers):
+        log_message(f"Chunk {chunk_id}: correct_index {correct_index} >= len(answers) {len(answers)}, clamping", log_level="WARNING")
+        correct_index = len(answers) - 1
+        correct_answer_number = correct_index + 1
+
     # Log if AI didn't follow our instruction (for debugging purposes)
     if ai_reported_answer != target_correct_position:
-        log_message(f"Chunk {chunk_id}: AI reported answer {ai_reported_answer} but we specified {target_correct_position}", 
+        log_message(f"Chunk {chunk_id}: AI reported answer {ai_reported_answer} but we specified {target_correct_position}",
                    log_level="DEBUG")
     
     # Format the question with context and embedded choices like in NAT-MC.json
