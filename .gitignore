@@ -64,6 +64,8 @@ literature_data/
 benchmark_results/
 reasoning_analysis/
 final_reports/
+ASM_595/
+plos_genetics_papers/
 
 # Generated files
 *.json
@@ -84,6 +86,7 @@ tmp/
 temp/
 .tmp/
 .cache/
+*.temp
 
 # NLTK data (downloaded during installation)
 nltk_data/
