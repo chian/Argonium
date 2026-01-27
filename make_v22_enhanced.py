@@ -327,7 +327,7 @@ class EnhancedAPIManager:
         backoff.expo,
         (Exception,),
         max_tries=5,  # More retries
-        max_time=30,  # Shorter total time
+        max_time=5,   # Reduced from 30s to avoid holding semaphore slots
         base=2,       # Faster exponential growth
         jitter=backoff.random_jitter,
         giveup=lambda e: (
@@ -768,7 +768,7 @@ class EnhancedChunkProcessor:
                 # Process tasks with minimal wait time for immediate response
                 while in_flight:
                     if 0: print(f"DEBUG: About to wait on {len(in_flight)} tasks")
-                    done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+                    done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
                     if 0: print(f"DEBUG: asyncio.wait returned {len(done)} done, {len(pending)} pending")
                     in_flight = list(pending)
                     
