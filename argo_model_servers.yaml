@@ -63,4 +63,5 @@ servers:
   openai_api_key: api+key
   openai_api_base: http://172.16.46.1:8073/v1
   openai_model: kimi-k2-thinking
+  max_completion_tokens: 32000
 
