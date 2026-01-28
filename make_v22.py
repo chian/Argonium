@@ -58,6 +58,7 @@ _max_error_threshold = 200  # Maximum number of errors before stopping the progr
 _preloaded_chunks = None  # Pre-loaded chunk IDs for generate_questions_from_chunks.py
 _preloaded_chunks_dir = None  # Directory containing pre-loaded chunks (flat structure)
 _openai_client = None  # OpenAI client instance
+_max_completion_tokens = None  # Max completion tokens for API calls (per-model config)
 
 
 class TerminalUI:
@@ -692,23 +693,27 @@ def cleanup_ui():
 def batched_openai_completion(model: str, messages: list, **kwargs):
     """
     Make an OpenAI API call using standard API.
-    
+
     Args:
         model: The model to use
         messages: The messages to send
         **kwargs: Additional parameters for the API call
-        
+
     Returns:
         The API response as a dictionary (compatible with OpenAI API 1.0+)
     """
-    global _openai_client
-    
+    global _openai_client, _max_completion_tokens
+
     # Prepare request parameters
     request_params = {
         "model": model,
         "messages": messages,
         **kwargs
     }
+
+    # Add max_completion_tokens if configured for this model
+    if _max_completion_tokens and "max_completion_tokens" not in kwargs:
+        request_params["max_completion_tokens"] = _max_completion_tokens
     
     try:
         response = _openai_client.chat.completions.create(**request_params)
@@ -4769,7 +4774,7 @@ def configure_apis(model_name: str, config_file: str = "model_servers.yaml") -> 
             sys.exit(1)
     
     # Initialize the OpenAI client
-    global _openai_client
+    global _openai_client, _max_completion_tokens
     
     # Prepare client configuration
     client_config = {
@@ -4789,11 +4794,16 @@ def configure_apis(model_name: str, config_file: str = "model_servers.yaml") -> 
     
     # Get the actual model name to use
     actual_model_name = selected_server.get("openai_model")
-    
+
+    # Get max_completion_tokens if specified for this model
+    _max_completion_tokens = selected_server.get("max_completion_tokens")
+
     base_url = selected_server.get("openai_api_base", "https://api.openai.com/v1")
     log_message(f"Configured OpenAI API with base URL: {base_url}")
     log_message(f"Using model shortname: {model_name}")
     log_message(f"Actual model identifier: {actual_model_name}")
+    if _max_completion_tokens:
+        log_message(f"Max completion tokens: {_max_completion_tokens}")
     
     # Batch API support removed in v19
     
