@@ -1399,22 +1399,20 @@ def human_readable_time(seconds: float) -> str:
 
 def generate_file_id(file_path: str) -> str:
     """
-    Generate a unique identifier for a file using its path and last modified time.
+    Generate a unique identifier for a file using its path only.
     Handles both regular files and files inside ZIP archives.
+    Note: modification time removed to ensure stable IDs across cloud syncs.
     """
     try:
         # Handle ZIP file paths (format: "zip_path::file_in_zip")
         if "::" in file_path:
             zip_path, file_in_zip = file_path.split("::", 1)
-            # Get modification time of the ZIP file
-            mod_time = os.path.getmtime(zip_path)
             # Include both ZIP path and internal file path in the ID
-            file_info = f"{zip_path}::{file_in_zip}_{mod_time}"
+            file_info = f"{zip_path}::{file_in_zip}"
         else:
-            # Regular file
-            mod_time = os.path.getmtime(file_path)
-            file_info = f"{file_path}_{mod_time}"
-        
+            # Regular file - use path only
+            file_info = file_path
+
         # Use SHA-256 for generating a unique ID
         file_id = hashlib.sha256(file_info.encode()).hexdigest()[:16]
         return file_id
@@ -3889,6 +3887,24 @@ def process_directory(input_dir: str, output_file: str, chunks_dir: str, model_n
             
         # Check for pre-loaded chunks FIRST (from generate_questions_from_chunks.py)
         # Skip Steps 1 and 2 entirely if we have pre-loaded chunks
+        # Also auto-detect existing chunks directory to skip file scanning
+        global _preloaded_chunks, _preloaded_chunks_dir
+        if _preloaded_chunks is None and os.path.isdir(chunks_dir):
+            # Check if chunks_dir has existing chunks
+            existing_chunks = []
+            for item in os.listdir(chunks_dir):
+                item_path = os.path.join(chunks_dir, item)
+                if os.path.isdir(item_path):
+                    for f in os.listdir(item_path):
+                        if f.endswith('.txt'):
+                            existing_chunks.append(f.replace('.txt', ''))
+                elif item.endswith('.txt'):
+                    existing_chunks.append(item.replace('.txt', ''))
+            if existing_chunks:
+                log_message(f"Auto-detected {len(existing_chunks)} existing chunks in {chunks_dir}, skipping file scanning")
+                _preloaded_chunks = existing_chunks
+                _preloaded_chunks_dir = os.path.abspath(chunks_dir)
+
         _using_preloaded_chunks = _preloaded_chunks is not None
 
         if _using_preloaded_chunks:

@@ -757,6 +757,7 @@ class EnhancedChunkProcessor:
                 if 0: print(f"DEBUG: About to prime window with up to {min(window, len(all_chunks))} tasks from {len(all_chunks)} total chunks")
                 for i in range(min(window, len(all_chunks))):
                     cid = next(chunk_iter)
+                    remaining_chunks -= 1  # Keep counter in sync with iterator
                     if 0: print(f"DEBUG: Got chunk ID from iterator: {cid}")
                     if 0: print(f"DEBUG: Creating task for chunk {cid}")
                     task = asyncio.create_task(process_single_chunk(cid))
